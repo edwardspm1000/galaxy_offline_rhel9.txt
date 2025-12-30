@@ -181,3 +181,370 @@ curl -I http://localhost:8080
 
 
 ✅ Galaxy UI should load.
+
+Running Galaxy as a systemd Service (Offline Production)
+
+This section describes how to run Galaxy as a persistent system service on an offline RHEL 9 system, using a dedicated galaxy user and a Python virtual environment.
+This is the recommended production approach.
+
+Prerequisites
+
+Galaxy installed at:
+
+/home/galaxy/galaxy
+
+
+Python virtual environment:
+
+/home/galaxy/galaxy/.venv
+
+
+Galaxy verified to start manually:
+
+cd /home/galaxy/galaxy
+source .venv/bin/activate
+./run.sh
+
+1. Create the Galaxy system user (if not already present)
+sudo useradd -r -m -d /home/galaxy -s /bin/bash galaxy || true
+
+
+Ensure ownership:
+
+sudo chown -R galaxy:galaxy /home/galaxy/galaxy
+
+2. Configure Galaxy network binding
+
+Edit the Galaxy configuration:
+
+sudo -u galaxy nano /home/galaxy/galaxy/config/galaxy.yml
+
+
+Ensure the following values exist:
+
+galaxy:
+  host: 0.0.0.0
+  port: 8080
+
+
+This allows access from other machines on the network.
+
+3. Create the systemd service file
+
+Create the Galaxy service unit:
+
+sudo tee /etc/systemd/system/galaxy.service >/dev/null <<'EOF'
+[Unit]
+Description=Galaxy Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=galaxy
+Group=galaxy
+WorkingDirectory=/home/galaxy/galaxy
+
+Environment="VIRTUAL_ENV=/home/galaxy/galaxy/.venv"
+Environment="PATH=/home/galaxy/galaxy/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+Environment="NODE_OPTIONS=--max-old-space-size=4096"
+
+ExecStart=/home/galaxy/galaxy/.venv/bin/python /home/galaxy/galaxy/scripts/common_startup.sh
+ExecStop=/bin/kill -TERM $MAINPID
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/home/galaxy/galaxy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+4. Enable and start the service
+sudo systemctl daemon-reload
+sudo systemctl enable --now galaxy
+
+
+Check status:
+
+sudo systemctl status galaxy --no-pager -l
+
+
+View logs:
+
+sudo journalctl -u galaxy -f
+
+5. Verify Galaxy is listening
+ss -tulpen | grep 8080
+
+
+Test locally:
+
+curl -I http://localhost:8080
+
+
+From another machine:
+
+http://<GALAXY_SERVER_IP>:8080
+
+6. Firewall configuration (if enabled)
+sudo firewall-cmd --add-port=8080/tcp --permanent
+sudo firewall-cmd --reload
+
+7. SELinux configuration (if Enforcing)
+
+Check mode:
+
+getenforce
+
+
+If enforcing, allow Galaxy port:
+
+sudo semanage port -a -t http_port_t -p tcp 8080 \
+  || sudo semanage port -m -t http_port_t -p tcp 8080
+
+8. Service management commands
+
+Stop Galaxy:
+
+sudo systemctl stop galaxy
+
+
+Start Galaxy:
+
+sudo systemctl start galaxy
+
+
+Restart Galaxy:
+
+sudo systemctl restart galaxy
+
+
+Disable at boot:
+
+sudo systemctl disable galaxy
+
+Notes
+
+This setup does not require internet access
+
+Gravity is not required
+
+Galaxy runs entirely under the galaxy user
+
+Logs are available via journalctl
+
+SQLite is suitable for testing; PostgreSQL is recommended for production
+
+
+
+
+
+by default Galaxy is restricted, and what you’re seeing is exactly what happens when it’s only listening on localhost.
+Turning off the firewall alone is not sufficient.
+
+Let’s go through this cleanly and quickly.
+
+✅ Why you can ping but not connect
+
+Ping only proves:
+
+IP routing works
+
+The VM is reachable at Layer 3
+
+It does not mean:
+
+Galaxy is listening on the network
+
+The port is open
+
+SELinux allows it
+
+The service is bound to the correct interface
+
+Galaxy defaults to 127.0.0.1 unless told otherwise.
+
+🔍 Step 1 — Confirm what Galaxy is listening on
+
+On the Galaxy VM, run:
+
+ss -tulpen | grep galaxy
+
+
+or more generally:
+
+ss -tulpen | grep 8080
+
+If you see:
+127.0.0.1:8080
+
+
+➡️ Only local connections allowed (this is your issue)
+
+You want to see:
+0.0.0.0:8080
+
+
+or
+
+<VM-IP>:8080
+
+🛠️ Step 2 — Configure Galaxy to listen on all interfaces
+
+Edit your Galaxy config:
+
+nano /home/galaxy/galaxy/config/galaxy.yml
+
+
+Set (or add):
+
+galaxy:
+  host: 0.0.0.0
+  port: 8080
+
+
+Or older-style config (still valid):
+
+server:
+  bind: 0.0.0.0:8080
+
+
+⚠️ Do not use 127.0.0.1
+
+🔄 Step 3 — Restart Galaxy
+
+As the galaxy user:
+
+cd /home/galaxy/galaxy
+source .venv/bin/activate
+galaxy stop
+galaxy start
+
+
+(or ./run.sh if using that)
+
+Recheck:
+
+ss -tulpen | grep 8080
+
+🌐 Step 4 — Test locally on the VM
+
+From the VM itself:
+
+curl http://localhost:8080
+
+
+You should get HTML output.
+
+🌍 Step 5 — Test from another machine
+
+From another PC on the same network:
+
+http://<VM-IP>:8080
+
+
+Example:
+
+http://192.168.1.50:8080
+
+🔐 Step 6 — SELinux (very common on RHEL)
+
+Even with firewall off, SELinux can still block traffic.
+
+Check mode:
+
+getenforce
+
+If it says Enforcing (likely):
+
+Temporarily test:
+
+sudo setenforce 0
+
+
+If that fixes it → SELinux policy is blocking Galaxy.
+
+Proper fix (recommended):
+sudo semanage port -a -t http_port_t -p tcp 8080
+
+
+(install if missing: dnf install policycoreutils-python-utils)
+
+🧱 Step 7 — Firewall (when you turn it back on)
+
+When ready:
+
+sudo firewall-cmd --add-port=8080/tcp --permanent
+sudo firewall-cmd --reload
+
+🖥️ VMware-specific checks (very important)
+
+Since you’re using VMware Workstation:
+
+Network adapter MUST be:
+
+Bridged (preferred), or
+
+NAT with port forwarding
+
+Check:
+
+ip addr show
+
+
+Make sure the VM has an IP on the same subnet as your PC.
+
+❌ What Galaxy does NOT restrict by default
+
+Galaxy does not restrict by:
+
+Source IP
+
+Subnet
+
+Hostname
+
+If it’s listening on 0.0.0.0 and the port is reachable, any IP can connect unless you configure auth or reverse proxies.
+
+✅ Quick checklist (90% of issues)
+
+✔️ Galaxy bound to 0.0.0.0
+✔️ Port 8080 listening
+✔️ SELinux not blocking
+✔️ Firewall allows 8080
+✔️ VM network is bridged/NAT-forwarded
+
+🔒 Later (recommended for production)
+
+Once testing is done, you’ll likely want:
+
+Reverse proxy (nginx)
+
+TLS
+
+IP restrictions
+
+Authentication hardening
+
+I can help with that when you’re ready.
+
+💡 TL;DR (most likely fix)
+
+Your Galaxy is listening on 127.0.0.1.
+Set host: 0.0.0.0, restart, and it will work.
+
+If you want, paste the output of:
+
+ss -tulpen | grep 8080
+
+
+and I’ll confirm it instantly.
