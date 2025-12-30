@@ -1,0 +1,183 @@
+🧬 Galaxy Offline Install on RHEL 9 (Authoritative Runbook)
+
+Tested scenario
+
+RHEL 9.x
+
+Online “staging” VM with internet
+
+Offline / air-gapped target with only BaseOS + AppStream
+
+Single transfer preferred
+
+No Gravity required
+
+Runs as non-root galaxy user
+
+PART 0 — Accounts & system prep (ONLINE + OFFLINE)
+Required users
+
+Create once on both systems:
+
+sudo useradd -r -m -d /home/galaxy -s /bin/bash galaxy
+
+PART 1 — Online system: prepare offline bundle
+1. Enable required RHEL repos (online system)
+sudo subscription-manager repos \
+  --enable=rhel-9-for-x86_64-baseos-rpms \
+  --enable=rhel-9-for-x86_64-appstream-rpms
+
+2. Create working directories
+mkdir -p /srv/galaxy-offline/{rpms,pip}
+mkdir -p /root/galaxy-src
+
+3. Download Galaxy source
+cd /root/galaxy-src
+git clone https://github.com/galaxyproject/galaxy.git
+cd galaxy
+
+
+(Stick to default branch unless you need a specific release.)
+
+4. Download ALL required system RPMs (one time)
+sudo dnf download \
+  --resolve \
+  --alldeps \
+  --destdir=/srv/galaxy-offline/rpms \
+  gcc gcc-c++ make \
+  python3 python3-devel python3-pip \
+  libffi-devel openssl-devel \
+  bzip2-devel zlib-devel \
+  sqlite sqlite-devel \
+  nodejs git rsync wget curl
+
+
+Create offline repo metadata:
+
+sudo createrepo_c /srv/galaxy-offline/rpms
+
+5. Download ALL Python dependencies (offline pip cache)
+cd /root/galaxy-src/galaxy
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install --upgrade pip setuptools wheel
+
+pip download \
+  --dest /srv/galaxy-offline/pip \
+  -r requirements.txt
+
+
+⚠️ Critical: this step must complete without errors.
+
+6. Build Galaxy client (ONLINE ONLY)
+
+This avoids Node/Vite memory pain offline.
+
+make client-production
+
+7. Remove large runtime junk (before packaging)
+rm -rf database/dependencies/_conda
+rm -rf database/jobs database/objects
+
+8. Fix permissions (important)
+sudo chmod -R a+rX /srv/galaxy-offline
+
+9. Create the ONE transfer bundle
+sudo tar -czf /root/galaxy-airgap-bundle.tar.gz \
+  /srv/galaxy-offline \
+  /root/galaxy-src/galaxy
+
+
+✅ This is the only file you need to move
+
+PART 2 — Transfer to offline system
+
+Use any approved method:
+
+USB
+
+Secure copy via jump host
+
+Approved file gateway
+
+Place it at:
+
+/root/galaxy-airgap-bundle.tar.gz
+
+PART 3 — Offline system: install Galaxy
+10. Extract bundle
+cd /
+sudo tar -xzf /root/galaxy-airgap-bundle.tar.gz
+
+
+You should now have:
+
+/srv/galaxy-offline
+
+/root/galaxy-src/galaxy
+
+11. Configure offline RPM repo
+sudo tee /etc/yum.repos.d/galaxy-offline.repo <<EOF
+[galaxy-offline]
+name=Galaxy Offline Repo
+baseurl=file:///srv/galaxy-offline/rpms
+enabled=1
+gpgcheck=0
+EOF
+
+
+Disable other repos:
+
+sudo mv /etc/yum.repos.d/redhat.repo /etc/yum.repos.d/redhat.repo.disabled
+sudo dnf clean all
+
+12. Install system dependencies (OFFLINE)
+sudo dnf install -y \
+  gcc gcc-c++ make \
+  python3 python3-devel python3-pip \
+  libffi-devel openssl-devel \
+  bzip2-devel zlib-devel \
+  sqlite sqlite-devel \
+  nodejs git rsync wget curl \
+  --disablerepo="*" \
+  --enablerepo="galaxy-offline"
+
+13. Move Galaxy to galaxy user (no copy, no duplication)
+sudo mkdir -p /home/galaxy/galaxy
+sudo rsync -a --remove-source-files /root/galaxy-src/galaxy/ /home/galaxy/galaxy/
+sudo chown -R galaxy:galaxy /home/galaxy/galaxy
+
+14. Offline Python install (galaxy user)
+sudo -u galaxy bash -lc '
+cd /home/galaxy/galaxy
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel \
+  --no-index --find-links=file:///srv/galaxy-offline/pip
+python -m pip install \
+  --no-index --find-links=file:///srv/galaxy-offline/pip \
+  -r requirements.txt
+'
+
+15. Configure Galaxy
+sudo -u galaxy bash -lc '
+cd /home/galaxy/galaxy
+cp config/galaxy.yml.sample config/galaxy.yml
+'
+
+
+(Optional: set admin user, database path, etc.)
+
+16. Start Galaxy (NO Gravity)
+sudo -u galaxy bash -lc '
+cd /home/galaxy/galaxy
+source .venv/bin/activate
+bash ./run.sh
+'
+
+17. Test
+curl -I http://localhost:8080
+
+
+✅ Galaxy UI should load.
