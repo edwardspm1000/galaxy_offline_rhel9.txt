@@ -1,123 +1,155 @@
-🧬 Galaxy Offline Install on RHEL 9 (Authoritative Runbook)
+Galaxy Offline Installation (RHEL 9) – Complete Start-to-Finish Guide
 
-Tested scenario
-
-RHEL 9.x
-
-Online “staging” VM with internet
-
-Offline / air-gapped target with only BaseOS + AppStream
-
-Single transfer preferred
-
-No Gravity required
-
-Runs as non-root galaxy user
-
-PART 0 — Accounts & system prep (ONLINE + OFFLINE)
-Required users
-
-Create once on both systems:
-
+Below is a clean, start-to-finish, battle-tested guide for installing Galaxy on RHEL 9 with an online build VM and an air-gapped offline VM, ending with Galaxy running as a systemd service offline (no user intervention).
+This version includes the real gotchas we hit:
+•	RHEL9 module metadata problem for Node.js offline (we avoid Node offline)
+•	Missing wheel / isa-rwval wheelhouse issues
+•	RHEL9 subscription-manager regenerating redhat.repo offline
+•	SELinux blocking execution from /home (we set permissive)
+•	Running Galaxy as a service without run.sh installing requirements (direct gunicorn start + PYTHONPATH)
+________________________________________
+Galaxy Air-Gapped Install (RHEL 9) – Online Build → Offline Service
+Assumptions
+•	Online RHEL 9 VM (has internet): build + bundle creation
+•	Offline RHEL 9 VM (air-gapped): deploy + run in service
+•	Single transfer preferred (one tarball)
+In practice, if you miss wheels you may need a tiny “patch” tarball.
+________________________________________
+0) System Requirements
+Minimum practical (client build is heavy):
+•	CPU: 4 vCPU
+•	RAM: 16 GB (20–32 GB safer)
+•	Disk: 150 GB minimum (more recommended)
+________________________________________
+1) Common Layout (both servers)
+Create galaxy user:
 sudo useradd -r -m -d /home/galaxy -s /bin/bash galaxy
+Directory layout:
+•	/home/galaxy/galaxy – Galaxy source
+•	/srv/galaxy-offline/pip – wheelhouse (all Python wheels for offline)
+•	/srv/galaxy-offline/rpms – local RPM repo
+•	/srv/gravity – Gravity source (online only, for wheel build)
+________________________________________
+✅ ONLINE SERVER (build system)
+2) Enable RHEL repos (online)
+sudo subscription-manager register
+sudo subscription-manager attach --auto
 
-PART 1 — Online system: prepare offline bundle
-1. Enable required RHEL repos (online system)
 sudo subscription-manager repos \
   --enable=rhel-9-for-x86_64-baseos-rpms \
   --enable=rhel-9-for-x86_64-appstream-rpms
-
-2. Create working directories
-mkdir -p /srv/galaxy-offline/{rpms,pip}
-mkdir -p /root/galaxy-src
-
-3. Download Galaxy source
-cd /root/galaxy-src
-git clone https://github.com/galaxyproject/galaxy.git
-cd galaxy
-
-
-(Stick to default branch unless you need a specific release.)
-
-4. Download ALL required system RPMs (one time)
-sudo dnf download \
-  --resolve \
-  --alldeps \
-  --destdir=/srv/galaxy-offline/rpms \
+3) Install build dependencies (online)
+sudo dnf install -y \
   gcc gcc-c++ make \
   python3 python3-devel python3-pip \
   libffi-devel openssl-devel \
   bzip2-devel zlib-devel \
   sqlite sqlite-devel \
-  nodejs git rsync wget curl
+  git rsync wget curl \
+  nodejs npm \
+  dnf-utils createrepo_c \
+  rust cargo
+Verify Node:
+node -v
+npm -v
+Install yarn (Galaxy client build needs it):
+sudo npm install -g yarn
+4) Clone Galaxy (online)
+sudo -u galaxy bash -lc '
+cd ~
+git clone https://github.com/galaxyproject/galaxy.git
+cd galaxy
+git checkout release_24.2
+'
+5) Create venv + upgrade pip tooling (online)
+sudo -u galaxy bash -lc '
+set -e
+cd /home/galaxy/galaxy
+python3 -m venv .venv
+.venv/bin/python -m ensurepip --upgrade || true
+.venv/bin/python -m pip install --upgrade pip setuptools wheel
+.venv/bin/python -m pip -V
+'
+6) Build the Galaxy client (UI) (online)
+Important: Yarn must be in PATH for the galaxy user. If needed:
+export PATH=/usr/local/bin:$PATH
+sudo -u galaxy bash -lc '
+set -e
+cd /home/galaxy/galaxy
+source .venv/bin/activate
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+export NODE_OPTIONS="--max_old_space_size=8192"
+make client-production
+'
+7) Build Gravity wheel (online)
+Clone gravity:
+sudo mkdir -p /srv
+sudo chown galaxy:galaxy /srv
 
-
-Create offline repo metadata:
+sudo -u galaxy bash -lc '
+cd /srv
+git clone https://github.com/nsoranzo/gravity.git
+'
+Create wheelhouse:
+sudo mkdir -p /srv/galaxy-offline/pip /srv/galaxy-offline/rpms
+sudo chown -R galaxy:galaxy /srv/galaxy-offline
+Build gravity wheel:
+sudo -u galaxy bash -lc '
+set -e
+source /home/galaxy/galaxy/.venv/bin/activate
+pip wheel --no-deps -w /srv/galaxy-offline/pip /srv/gravity
+ls -lh /srv/galaxy-offline/pip | egrep "gravity-.*whl"
+'
+8) Download Python requirements into wheelhouse (online)
+sudo -u galaxy bash -lc '
+set -e
+cd /home/galaxy/galaxy
+source .venv/bin/activate
+export PYTHONNOUSERSITE=1
+pip download -r requirements.txt --dest /srv/galaxy-offline/pip
+'
+Critical add-ons (avoid offline failure)
+We hit these in real life. Add them now:
+sudo -u galaxy bash -lc '
+set -e
+source /home/galaxy/galaxy/.venv/bin/activate
+pip download --dest /srv/galaxy-offline/pip wheel
+pip wheel -w /srv/galaxy-offline/pip isa-rwval==0.10.11
+ls -lh /srv/galaxy-offline/pip | egrep "wheel-|isa[_-]rwval"
+'
+9) Download RPMs into local repo (online)
+Note: Node/npm RPMs are modular on RHEL9. Offline modular metadata is painful.
+Offline server does not need nodejs/npm (client already built), so don’t bother including nodejs RPMs unless you plan to handle module metadata.
+sudo dnf download --resolve \
+  gcc gcc-c++ make \
+  python3 python3-devel python3-pip \
+  libffi-devel openssl-devel \
+  bzip2-devel zlib-devel \
+  sqlite sqlite-devel \
+  git rsync wget curl \
+  policycoreutils-python-utils \
+  --destdir /srv/galaxy-offline/rpms
 
 sudo createrepo_c /srv/galaxy-offline/rpms
-
-5. Download ALL Python dependencies (offline pip cache)
-cd /root/galaxy-src/galaxy
-python3 -m venv .venv
-source .venv/bin/activate
-
-pip install --upgrade pip setuptools wheel
-
-pip download \
-  --dest /srv/galaxy-offline/pip \
-  -r requirements.txt
-
-
-⚠️ Critical: this step must complete without errors.
-
-6. Build Galaxy client (ONLINE ONLY)
-
-This avoids Node/Vite memory pain offline.
-
-make client-production
-
-7. Remove large runtime junk (before packaging)
-rm -rf database/dependencies/_conda
-rm -rf database/jobs database/objects
-
-8. Fix permissions (important)
-sudo chmod -R a+rX /srv/galaxy-offline
-
-9. Create the ONE transfer bundle
-sudo tar -czf /root/galaxy-airgap-bundle.tar.gz \
-  /srv/galaxy-offline \
-  /root/galaxy-src/galaxy
-
-
-✅ This is the only file you need to move
-
-PART 2 — Transfer to offline system
-
-Use any approved method:
-
-USB
-
-Secure copy via jump host
-
-Approved file gateway
-
-Place it at:
-
-/root/galaxy-airgap-bundle.tar.gz
-
-PART 3 — Offline system: install Galaxy
-10. Extract bundle
-cd /
-sudo tar -xzf /root/galaxy-airgap-bundle.tar.gz
-
-
-You should now have:
-
-/srv/galaxy-offline
-
-/root/galaxy-src/galaxy
-
-11. Configure offline RPM repo
+10) Create single transfer tarball (online)
+sudo tar czf /root/galaxy-airgap-bundle.tar.gz \
+  /home/galaxy/galaxy \
+  /srv/galaxy-offline
+ls -lh /root/galaxy-airgap-bundle.tar.gz
+Transfer /root/galaxy-airgap-bundle.tar.gz to the offline server.
+________________________________________
+🔒 OFFLINE SERVER (air-gapped)
+11) Create galaxy user (offline)
+sudo useradd -r -m -d /home/galaxy -s /bin/bash galaxy
+12) Extract bundle (offline)
+sudo tar xzf /root/galaxy-airgap-bundle.tar.gz -C /
+sudo chown -R galaxy:galaxy /home/galaxy /srv/galaxy-offline
+Verify:
+ls -ld /home/galaxy/galaxy
+ls -l /srv/galaxy-offline
+________________________________________
+13) Configure offline-only DNF repo (offline)
+Create local repo file:
 sudo tee /etc/yum.repos.d/galaxy-offline.repo <<EOF
 [galaxy-offline]
 name=Galaxy Offline Repo
@@ -125,119 +157,95 @@ baseurl=file:///srv/galaxy-offline/rpms
 enabled=1
 gpgcheck=0
 EOF
-
-
-Disable other repos:
-
-sudo mv /etc/yum.repos.d/redhat.repo /etc/yum.repos.d/redhat.repo.disabled
+CRITICAL: Stop subscription-manager from regenerating redhat.repo
+Disable the plugin (this is what finally worked):
+sudo sed -i 's/^enabled=.*/enabled=0/' /etc/dnf/plugins/subscription-manager.conf
+Remove redhat repo file(s):
+sudo rm -f /etc/yum.repos.d/redhat.repo
+Cache only offline:
 sudo dnf clean all
-
-12. Install system dependencies (OFFLINE)
+sudo dnf makecache --disablerepo="*" --enablerepo="galaxy-offline"
+dnf repolist
+Expected: only galaxy-offline
+________________________________________
+14) Install OS packages (offline)
+Do NOT install nodejs/npm offline (modular metadata problem).
 sudo dnf install -y \
   gcc gcc-c++ make \
   python3 python3-devel python3-pip \
   libffi-devel openssl-devel \
   bzip2-devel zlib-devel \
   sqlite sqlite-devel \
-  nodejs git rsync wget curl \
-  --disablerepo="*" \
-  --enablerepo="galaxy-offline"
-
-13. Move Galaxy to galaxy user (no copy, no duplication)
-sudo mkdir -p /home/galaxy/galaxy
-sudo rsync -a --remove-source-files /root/galaxy-src/galaxy/ /home/galaxy/galaxy/
-sudo chown -R galaxy:galaxy /home/galaxy/galaxy
-
-14. Offline Python install (galaxy user)
+  git rsync wget curl \
+  policycoreutils-python-utils \
+  --disablerepo="*" --enablerepo="galaxy-offline"
+________________________________________
+15) Configure pip offline (offline)
+sudo mkdir -p /home/galaxy/.config/pip
+sudo tee /home/galaxy/.config/pip/pip.conf <<EOF
+[global]
+no-index = true
+find-links = file:///srv/galaxy-offline/pip
+disable-pip-version-check = true
+EOF
+sudo chown -R galaxy:galaxy /home/galaxy/.config
+________________________________________
+16) Create venv + install requirements from wheelhouse (offline)
 sudo -u galaxy bash -lc '
+set -e
 cd /home/galaxy/galaxy
+rm -rf .venv
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel \
-  --no-index --find-links=file:///srv/galaxy-offline/pip
-python -m pip install \
-  --no-index --find-links=file:///srv/galaxy-offline/pip \
-  -r requirements.txt
-'
 
-15. Configure Galaxy
+# Ensure wheel exists and is installable offline
+.venv/bin/python -m pip install --no-index --find-links=file:///srv/galaxy-offline/pip wheel setuptools
+
+# Install gravity + requirements
+.venv/bin/python -m pip install --no-index --find-links=file:///srv/galaxy-offline/pip --force-reinstall --no-deps gravity==1.1.1
+.venv/bin/python -m pip install --no-index --find-links=file:///srv/galaxy-offline/pip -r requirements.txt
+
+# verify
+.venv/bin/python -m pip show gravity
+.venv/bin/python -m pip show isa-rwval
+'
+________________________________________
+17) Create Galaxy config (offline)
 sudo -u galaxy bash -lc '
 cd /home/galaxy/galaxy
 cp config/galaxy.yml.sample config/galaxy.yml
 '
-
-
-(Optional: set admin user, database path, etc.)
-
-16. Start Galaxy (NO Gravity)
-sudo -u galaxy bash -lc '
-cd /home/galaxy/galaxy
-source .venv/bin/activate
-bash ./run.sh
-'
-
-17. Test
-curl -I http://localhost:8080
-
-
-✅ Galaxy UI should load.
-
-Running Galaxy as a systemd Service (Offline Production)
-
-This section describes how to run Galaxy as a persistent system service on an offline RHEL 9 system, using a dedicated galaxy user and a Python virtual environment.
-This is the recommended production approach.
-
-Prerequisites
-
-Galaxy installed at:
-
-/home/galaxy/galaxy
-
-
-Python virtual environment:
-
-/home/galaxy/galaxy/.venv
-
-
-Galaxy verified to start manually:
-
-cd /home/galaxy/galaxy
-source .venv/bin/activate
-./run.sh
-
-1. Create the Galaxy system user (if not already present)
-sudo useradd -r -m -d /home/galaxy -s /bin/bash galaxy || true
-
-
-Ensure ownership:
-
-sudo chown -R galaxy:galaxy /home/galaxy/galaxy
-
-2. Configure Galaxy network binding
-
-Edit the Galaxy configuration:
-
-sudo -u galaxy nano /home/galaxy/galaxy/config/galaxy.yml
-
-
-Ensure the following values exist:
-
-galaxy:
+Edit:
+sudo vi /home/galaxy/galaxy/config/galaxy.yml
+Minimum:
+server:
   host: 0.0.0.0
   port: 8080
 
-
-This allows access from other machines on the network.
-
-3. Create the systemd service file
-
-Create the Galaxy service unit:
-
-sudo tee /etc/systemd/system/galaxy.service >/dev/null <<'EOF'
+galaxy_user: galaxy
+________________________________________
+18) SELinux (offline) – Make it work reliably
+We hit SELinux blocking execution of venv binaries from /home.
+Fast, practical solution: set permissive.
+Temporary:
+sudo setenforce 0
+getenforce
+Permanent:
+sudo vi /etc/selinux/config
+# set:
+SELINUX=permissive
+(Reboot later.)
+________________________________________
+✅ 19) Run Galaxy as a systemd service (offline) – NO run.sh installs
+This is the final working approach:
+•	Start gunicorn directly
+•	Ensure PYTHONPATH points to Galaxy source lib/ so import galaxy works
+•	Avoid run.sh dependency re-installs (which triggered isa-rwval “unavailable”)
+Create service:
+sudo tee /etc/systemd/system/galaxy.service <<'EOF'
 [Unit]
 Description=Galaxy Server
-After=network.target
-Wants=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -245,306 +253,102 @@ User=galaxy
 Group=galaxy
 WorkingDirectory=/home/galaxy/galaxy
 
-Environment="VIRTUAL_ENV=/home/galaxy/galaxy/.venv"
-Environment="PATH=/home/galaxy/galaxy/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
-Environment="NODE_OPTIONS=--max-old-space-size=4096"
+Environment=PATH=/home/galaxy/galaxy/.venv/bin:/usr/bin:/bin
+Environment=GALAXY_CONFIG_FILE=/home/galaxy/galaxy/config/galaxy.yml
+Environment=PYTHONPATH=/home/galaxy/galaxy/lib
 
-ExecStart=/home/galaxy/galaxy/.venv/bin/python /home/galaxy/galaxy/scripts/common_startup.sh
-ExecStop=/bin/kill -TERM $MAINPID
+ExecStart=/usr/bin/bash -lc 'cd /home/galaxy/galaxy && export PYTHONPATH=/home/galaxy/galaxy/lib && source .venv/bin/activate && exec gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8080 --workers 2 --timeout 300 galaxy.webapps.galaxy.fast_factory:factory'
 
-Restart=on-failure
-RestartSec=10
-
-StandardOutput=journal
-StandardError=journal
-
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=false
-ReadWritePaths=/home/galaxy/galaxy
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-4. Enable and start the service
+Enable and start:
 sudo systemctl daemon-reload
 sudo systemctl enable --now galaxy
-
-
-Check status:
-
-sudo systemctl status galaxy --no-pager -l
-
-
-View logs:
-
-sudo journalctl -u galaxy -f
-
-5. Verify Galaxy is listening
+systemctl status galaxy --no-pager
+Verify listener:
 ss -tulpen | grep 8080
-
-
-Test locally:
-
-curl -I http://localhost:8080
-
-
-From another machine:
-
-http://<GALAXY_SERVER_IP>:8080
-
-6. Firewall configuration (if enabled)
+Open in browser:
+•	http://<offline-server-ip>:8080
+If firewalld enabled:
 sudo firewall-cmd --add-port=8080/tcp --permanent
 sudo firewall-cmd --reload
-
-7. SELinux configuration (if Enforcing)
-
-Check mode:
-
-getenforce
-
-
-If enforcing, allow Galaxy port:
-
-sudo semanage port -a -t http_port_t -p tcp 8080 \
-  || sudo semanage port -m -t http_port_t -p tcp 8080
-
-8. Service management commands
-
-Stop Galaxy:
-
-sudo systemctl stop galaxy
-
-
-Start Galaxy:
-
-sudo systemctl start galaxy
-
-
-Restart Galaxy:
-
-sudo systemctl restart galaxy
-
-
-Disable at boot:
-
-sudo systemctl disable galaxy
-
-Notes
-
-This setup does not require internet access
-
-Gravity is not required
-
-Galaxy runs entirely under the galaxy user
-
-Logs are available via journalctl
-
-SQLite is suitable for testing; PostgreSQL is recommended for production
-
-
-
-
-
-by default Galaxy is restricted, and what you’re seeing is exactly what happens when it’s only listening on localhost.
-Turning off the firewall alone is not sufficient.
-
-Let’s go through this cleanly and quickly.
-
-✅ Why you can ping but not connect
-
-Ping only proves:
-
-IP routing works
-
-The VM is reachable at Layer 3
-
-It does not mean:
-
-Galaxy is listening on the network
-
-The port is open
-
-SELinux allows it
-
-The service is bound to the correct interface
-
-Galaxy defaults to 127.0.0.1 unless told otherwise.
-
-🔍 Step 1 — Confirm what Galaxy is listening on
-
-On the Galaxy VM, run:
-
-ss -tulpen | grep galaxy
-
-
-or more generally:
-
-ss -tulpen | grep 8080
-
-If you see:
-127.0.0.1:8080
-
-
-➡️ Only local connections allowed (this is your issue)
-
-You want to see:
-0.0.0.0:8080
-
-
-or
-
-<VM-IP>:8080
-
-🛠️ Step 2 — Configure Galaxy to listen on all interfaces
-
-Edit your Galaxy config:
-
-nano /home/galaxy/galaxy/config/galaxy.yml
-
-
-Set (or add):
-
-galaxy:
-  host: 0.0.0.0
-  port: 8080
-
-
-Or older-style config (still valid):
-
-server:
-  bind: 0.0.0.0:8080
-
-
-⚠️ Do not use 127.0.0.1
-
-🔄 Step 3 — Restart Galaxy
-
-As the galaxy user:
-
-cd /home/galaxy/galaxy
-source .venv/bin/activate
-galaxy stop
-galaxy start
-
-
-(or ./run.sh if using that)
-
-Recheck:
-
-ss -tulpen | grep 8080
-
-🌐 Step 4 — Test locally on the VM
-
-From the VM itself:
-
-curl http://localhost:8080
-
-
-You should get HTML output.
-
-🌍 Step 5 — Test from another machine
-
-From another PC on the same network:
-
-http://<VM-IP>:8080
-
-
-Example:
-
-http://192.168.1.50:8080
-
-🔐 Step 6 — SELinux (very common on RHEL)
-
-Even with firewall off, SELinux can still block traffic.
-
-Check mode:
-
-getenforce
-
-If it says Enforcing (likely):
-
-Temporarily test:
+Logs:
+journalctl -u galaxy -n 120 --no-pager
+________________________________________
+Troubleshooting Cheatsheet
+DNF still shows BaseOS/AppStream offline
+•	subscription-manager plugin is still enabled
+Fix:
+sudo sed -i 's/^enabled=.*/enabled=0/' /etc/dnf/plugins/subscription-manager.conf
+sudo rm -f /etc/yum.repos.d/redhat.repo
+Offline Node/npm install fails (“No available modular metadata”)
+•	Don’t install nodejs offline; build client online only.
+isa-rwval (unavailable) during offline pip install
+•	Ensure you built isa-rwval wheel online:
+pip wheel -w /srv/galaxy-offline/pip isa-rwval==0.10.11
+systemd 203/EXEC / Permission denied from venv
+•	SELinux blocking execution under /home (very common)
+Fix: permissive:
+sudo setenforce 0
+ModuleNotFoundError: No module named 'galaxy' in gunicorn
+•	Missing PYTHONPATH=/home/galaxy/galaxy/lib (required)
+
+
+FULL GALAXY config file in the end
+[Unit]
+Description=Galaxy Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=galaxy
+Group=galaxy
+WorkingDirectory=/home/galaxy/galaxy
+Environment=PATH=/home/galaxy/galaxy/.venv/bin:/usr/bin:/bin
+Environment=GALAXY_CONFIG_FILE=/home/galaxy/galaxy/config/galaxy.yml
+#Environment=PYTHONPATH=/home/galaxy/galaxy
+Environment=PYTHONPATH=/home/galaxy/galaxy/lib
+
+#ExecStart=/usr/bin/bash -lc 'cd /home/galaxy/galaxy && source .venv/bin/activate && exec gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8080>
+
+#ExecStart=/usr/bin/bash -lc 'cd /home/galaxy/galaxy && export PYTHONPATH=/home/galaxy/galaxy && source .venv/bin/activate && exec gunicorn -k uvic>
+ExecStart=/usr/bin/bash -lc 'cd /home/galaxy/galaxy && export PYTHONPATH=/home/galaxy/galaxy/lib && source .venv/bin/activate && exec gunicorn -k u>
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+Clear old files away
+PART 0 — Clean slate (optional but recommended on the online VM)
+If you want a clean test run on the online VM:
+sudo rm -rf /srv/galaxy-offline /root/galaxy-src /home/galaxy/galaxy /root/galaxy-airgap-bundle.tar.gz
+sudo userdel -r galaxy 2>/dev/null || true
+
+
+Disable SELinux
 
 sudo setenforce 0
 
+Permanent fix (recommended if this is a dedicated Galaxy box)
+Edit the SELinux config:
+sudo vi /etc/selinux/config
+Change:
+SELINUX=enforcing
+to:
+SELINUX=permissive
+Save and reboot when convenient:
+sudo reboot
+After reboot:
+getenforce
+Should still show:
+Permissive
+Galaxy will continue working under systemd without SELinux blocking your venv.
 
-If that fixes it → SELinux policy is blocking Galaxy.
-
-Proper fix (recommended):
-sudo semanage port -a -t http_port_t -p tcp 8080
-
-
-(install if missing: dnf install policycoreutils-python-utils)
-
-🧱 Step 7 — Firewall (when you turn it back on)
-
-When ready:
-
-sudo firewall-cmd --add-port=8080/tcp --permanent
-sudo firewall-cmd --reload
-
-🖥️ VMware-specific checks (very important)
-
-Since you’re using VMware Workstation:
-
-Network adapter MUST be:
-
-Bridged (preferred), or
-
-NAT with port forwarding
-
-Check:
-
-ip addr show
-
-
-Make sure the VM has an IP on the same subnet as your PC.
-
-❌ What Galaxy does NOT restrict by default
-
-Galaxy does not restrict by:
-
-Source IP
-
-Subnet
-
-Hostname
-
-If it’s listening on 0.0.0.0 and the port is reachable, any IP can connect unless you configure auth or reverse proxies.
-
-✅ Quick checklist (90% of issues)
-
-✔️ Galaxy bound to 0.0.0.0
-✔️ Port 8080 listening
-✔️ SELinux not blocking
-✔️ Firewall allows 8080
-✔️ VM network is bridged/NAT-forwarded
-
-🔒 Later (recommended for production)
-
-Once testing is done, you’ll likely want:
-
-Reverse proxy (nginx)
-
-TLS
-
-IP restrictions
-
-Authentication hardening
-
-I can help with that when you’re ready.
-
-💡 TL;DR (most likely fix)
-
-Your Galaxy is listening on 127.0.0.1.
-Set host: 0.0.0.0, restart, and it will work.
-
-If you want, paste the output of:
-
-ss -tulpen | grep 8080
-
-
-and I’ll confirm it instantly.
